@@ -1,57 +1,72 @@
+# data_preparation.py
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 
+class GrainEvolutionDataset(Dataset):
+    def __init__(self, data, time_history, time_future, skip_steps, train=True, train_split=0.8, filter_tolerance=1e-6):
+        super().__init__()
+        self.time_history = time_history
+        self.time_future = time_future
+        self.skip_steps = skip_steps
 
-class TestDataLoader:
-    def __init__(self, dataset_path, shift_number, time_steps, stride):
-        self.dataset_path = dataset_path
-        self.shift_number = shift_number
-        self.time_steps = time_steps
-        self.stride = stride
+        split_idx = int(train_split * data.shape[0])
+        self.data = data[:split_idx] if train else data[split_idx:]
+        self.sequences = self.create_sequences(self.data, filter_tolerance)
 
-    def load_and_preprocess(self):
-        dataset = np.load(self.dataset_path)
-        #dataset = dataset[:, 2:141, :, :][:, ::2, :, :]
-        return dataset
+        print(f"{'Training' if train else 'Validation'} dataset: {len(self.sequences)} sequences")
 
-    def create_sequences(self, dataset):
-        inp = dataset[:, :dataset.shape[1] - self.shift_number, :, :]
-        out = dataset[:, self.shift_number:dataset.shape[1], :, :]
-        xx_list, yy_list = [], []
+    def create_sequences(self, data, filter_tolerance):
+        sequences = []
+        total_steps = self.time_history + self.skip_steps + self.time_future
+        for sample in data:
+            for t in range(sample.shape[0] - total_steps + 1):
+                x = sample[t : t + self.time_history]
+                y = sample[t + self.time_history + self.skip_steps : t + total_steps]
+                if np.any(np.mean(np.abs(y - x[-1][np.newaxis, ...]), axis=(1, 2)) > filter_tolerance):
+                    sequences.append((torch.tensor(x).float(), torch.tensor(y).float()))
+        return sequences
 
-        for sample_idx in range(inp.shape[0]):
-            for seq_idx in range((inp.shape[1] - self.time_steps) // self.stride + 1):
-                start = seq_idx * self.stride
-                end = start + self.time_steps
-                xx_list.append(inp[sample_idx, start:end, :, :])
-                yy_list.append(out[sample_idx, start:end, :, :])
+    def __len__(self):
+        return len(self.sequences)
 
-        xx = np.stack(xx_list, axis=0)
-        yy = np.stack(yy_list, axis=0)
-        return xx, yy
+    def __getitem__(self, idx):
+        return self.sequences[idx]
 
-    def filter_identical_sequences(self, xx, yy, tolerance=1e-6):
-        difference = np.abs(xx - yy)
-        equal_arrays = np.all(difference < tolerance, axis=(1, 2, 3))
-        return xx[~equal_arrays], yy[~equal_arrays]
+def load_data(batch_size, time_history, time_future, skip_steps, filter_tolerance=1e-6, train_split=0.8):
+    print("Loading data...")
+    ss = np.load('Dataset_64.npy')
+    ff = np.load('Dataset_b_64.npy')[:, 4:, :, :]
+    data = np.concatenate((ss, ff), axis=0)[:, ::2, :, :]
+    print(f"Data shape: {data.shape}")
 
+    train_dataset = GrainEvolutionDataset(data, time_history, time_future, skip_steps, True, train_split, filter_tolerance)
+    val_dataset = GrainEvolutionDataset(data, time_history, time_future, skip_steps, False, train_split, filter_tolerance)
 
-if __name__ == "__main__":
-    dataset_path = "Dataset_b_256.npy"
-    shift_number = 10
-    time_steps = 10
-    stride = 1
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    loader = TestDataLoader(dataset_path, shift_number, time_steps, stride)
-    dataset = loader.load_and_preprocess()
-    xx, yy = loader.create_sequences(dataset)
-    xx, yy = loader.filter_identical_sequences(xx, yy)
+    return train_loader, val_loader, train_dataset, val_dataset
 
-    test_a = torch.from_numpy(xx).float().permute(0, 2, 3, 1)
-    test_u = torch.from_numpy(yy).float().permute(0, 2, 3, 1)
+class TestDataset(Dataset):
+    def __init__(self, data, time_history, time_future, skip_steps, sample_idx=None):
+        super().__init__()
+        if sample_idx is not None:
+            data = data[sample_idx:sample_idx+1]
+        self.sequences = self.create_sequences(data, time_history, time_future, skip_steps)
 
-    batch_size = 20
-    test_loader = DataLoader(TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=False)
+    def create_sequences(self, data, time_history, time_future, skip_steps):
+        sequences = []
+        total_steps = time_history + skip_steps + time_future
+        for sample in data:
+            for t in range(sample.shape[0] - total_steps + 1):
+                x = sample[t : t + time_history]
+                y = sample[t + time_history + skip_steps : t + total_steps]
+                sequences.append((torch.tensor(x).float(), torch.tensor(y).float()))
+        return sequences
 
-    print(f"Test data prepared. Input shape: {test_a.shape}, Output shape: {test_u.shape}")
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.sequences[idx]
