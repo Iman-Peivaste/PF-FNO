@@ -1,63 +1,49 @@
+# data_preparation.py
 import numpy as np
-import os
-from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import Dataset, DataLoader
 
-class DataLoader:
-    def __init__(self, dataset_path, shift_number, stride, time_steps):
-        self.dataset_path = dataset_path
-        self.shift_number = shift_number
-        self.stride = stride
-        self.time_steps = time_steps
+class GrainEvolutionDataset(Dataset):
+    def __init__(self, data, time_history, time_future, skip_steps, train=True, train_split=0.8, filter_tolerance=1e-6):
+        super().__init__()
+        self.time_history = time_history
+        self.time_future = time_future
+        self.skip_steps = skip_steps
 
-    def load_and_preprocess(self):
-        dataset = np.load(self.dataset_path)
-        #dataset = dataset[:, 2:141, :, :][:, ::2, :, :]
-        return dataset
+        split_idx = int(train_split * data.shape[0])
+        self.data = data[:split_idx] if train else data[split_idx:]
+        self.sequences = self.create_sequences(self.data, filter_tolerance)
 
-    def create_sequences(self, dataset):
-        inp = dataset[:, :dataset.shape[1] - self.shift_number, :, :]
-        out = dataset[:, self.shift_number:dataset.shape[1], :, :]
-        xx_list, yy_list = [], []
+        print(f"{'Training' if train else 'Validation'} dataset: {len(self.sequences)} sequences")
 
-        for sample_idx in range(inp.shape[0]):
-            for seq_idx in range((inp.shape[1] - self.time_steps) // self.stride + 1):
-                start = seq_idx * self.stride
-                end = start + self.time_steps
-                xx_list.append(inp[sample_idx, start:end, :, :])
-                yy_list.append(out[sample_idx, start:end, :, :])
+    def create_sequences(self, data, filter_tolerance):
+        sequences = []
+        total_steps = self.time_history + self.skip_steps + self.time_future
+        for sample in data:
+            for t in range(sample.shape[0] - total_steps + 1):
+                x = sample[t : t + self.time_history]
+                y = sample[t + self.time_history + self.skip_steps : t + total_steps]
+                if np.any(np.mean(np.abs(y - x[-1][np.newaxis, ...]), axis=(1, 2)) > filter_tolerance):
+                    sequences.append((torch.tensor(x).float(), torch.tensor(y).float()))
+        return sequences
 
-        xx = np.stack(xx_list, axis=0)
-        yy = np.stack(yy_list, axis=0)
-        return xx, yy
+    def __len__(self):
+        return len(self.sequences)
 
-    def remove_identical_sequences(self, xx, yy, tolerance=1e-6):
-        difference = np.abs(xx - yy)
-        equal_arrays = np.all(difference < tolerance, axis=(1, 2, 3))
-        return xx[~equal_arrays], yy[~equal_arrays]
+    def __getitem__(self, idx):
+        return self.sequences[idx]
 
+def load_data(batch_size, time_history, time_future, skip_steps, filter_tolerance=1e-6, train_split=0.8):
+    print("Loading data...")
+    ss = np.load('Dataset_64.npy')
+    ff = np.load('Dataset_b_64.npy')[:, 4:, :, :]
+    data = np.concatenate((ss, ff), axis=0)[:, ::2, :, :]
+    print(f"Data shape: {data.shape}")
 
-if __name__ == "__main__":
-    dataset_path = "Dataset_b_64.npy"
-    shift_number = 10
-    time_steps = 10
-    stride = 9
+    train_dataset = GrainEvolutionDataset(data, time_history, time_future, skip_steps, True, train_split, filter_tolerance)
+    val_dataset = GrainEvolutionDataset(data, time_history, time_future, skip_steps, False, train_split, filter_tolerance)
 
-    data_loader = DataLoader(dataset_path, shift_number, stride, time_steps)
-    dataset = data_loader.load_and_preprocess()
-    xx, yy = data_loader.create_sequences(dataset)
-    xx, yy = data_loader.remove_identical_sequences(xx, yy)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    #train_a, test_a, train_u, test_u = train_test_split(xx, yy, test_size=0.2, random_state=42)
-    split_idx = int(len(xx) * 0.8)  # 80% for training, 20% for testing
-
-  # Split the data
-    train_a, test_a = xx[:split_idx], xx[split_idx:]  # First 80% for training, last 20% for testing
-    train_u, test_u = yy[:split_idx], yy[split_idx:]  # Same for outputs
-    
-
-    np.save("train_a.npy", train_a)
-    np.save("train_u.npy", train_u)
-    np.save("test_a.npy", test_a)
-    np.save("test_u.npy", test_u)
-
-    print(f"Train and test datasets saved. Train shape: {train_a.shape}, Test shape: {test_a.shape}")
+    return train_loader, val_loader, train_dataset, val_dataset
